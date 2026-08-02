@@ -18,6 +18,8 @@ curl -o sr-scan.py https://raw.githubusercontent.com/LiuPeng-1024/site-rescue/ma
 wget -O sr-scan.py https://raw.githubusercontent.com/LiuPeng-1024/site-rescue/main/scan/sr-scan.py
 ```
 
+如果下载超时（部分服务器访问 GitHub 不稳）：在你自己电脑上打开这个链接，把文件另存为 sr-scan.py，然后用宝塔面板的「文件」管理器上传到服务器任一目录（比如 /root 或 /tmp），再在终端里 `cd` 过去执行第 3 步。
+
 **第 3 步**:再粘贴这行,回车 —— 把路径换成你自己的网站目录(宝塔默认在 `/www/wwwroot/你的域名`):
 
 ```bash
