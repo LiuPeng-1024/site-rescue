@@ -1,6 +1,6 @@
 # 案例 2：扫描器 60 请求/分钟打挂数据库（2026-08-02）
 
-> chongbaotong.com（宝塔+WP，阿里云 ECS 2GB）。状态：已结案。
+> 某猫粮比价站（宝塔+WP，阿里云 ECS 2GB）。状态：已结案。
 > 价值：证明"被黑应急"不止挂马一种形态——**扫描流量本身就能打死小服务器**；site-rescue 产品叙事的重要案例。
 
 ## 现象
@@ -30,7 +30,7 @@
 
 ## 加固（本案例新增）
 
-- CF 自定义规则"WP扫描防护"（托管质询，表达式见 docs/ops/cloudflare-deploy-chongbaotong.md §二.4）
+- CF 自定义规则"WP扫描防护"（托管质询：URI 命中 /wp-content/plugins/、xmlrpc.php、wp-admin、wp-login.php 即挑战）
 - php-fpm 并发上限收紧（2GB 机型 pm.max_children ≤10）
 
 ## 复查结果
