@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 REPO_URL = "https://github.com/LiuPeng-1024/site-rescue"
 
 # ---------------------------------------------------------------------------
@@ -47,6 +47,9 @@ RE_PREG_E = re.compile(
 # 同文件共现类检查(按整个文件内容判断)
 RE_B64_DECODE = re.compile(r'\bbase64_decode\s*\(', re.I)
 RE_EVAL_ANY = re.compile(r'\b(?:eval|assert)\s*\(', re.I)
+# 仅 eval:超长行升级的共现触发用它——assert() 在合法代码里是开发断言
+# (如 SimplePie Parser.php 的 \assert(function_exists(...))),不算混淆信号
+RE_EVAL_ONLY = re.compile(r'\beval\s*\(', re.I)
 RE_DANGER_FUNC = re.compile(r'\b(?:shell_exec|system|passthru|popen|proc_open)\s*\(', re.I)
 RE_INPUT_VAR = re.compile(r'\$_(?:GET|POST|REQUEST|COOKIE)', re.I)
 
@@ -54,7 +57,7 @@ RE_INPUT_VAR = re.compile(r'\$_(?:GET|POST|REQUEST|COOKIE)', re.I)
 RE_GOTO = re.compile(r'\bgoto\s+[A-Za-z_]', re.I)
 GOTO_THRESHOLD = 5
 
-# 超长单行(混淆代码典型特征)
+# 超长单行(混淆代码典型特征;v1.1 起单独命中降级为可疑,与其他特征共现才报高危)
 LONG_LINE_THRESHOLD = 2000
 
 # 随机文件名判断:全小写字母+数字、长度 >= 8,且元音占比极低或连续辅音很长
@@ -63,6 +66,54 @@ RANDOM_NAME_MIN_LEN = 8
 
 # wp-content/languages 下合法的翻译类文件名,如 zh_CN.php、en_GB.php
 RE_LOCALE_PHP = re.compile(r'^[a-z]{2,3}_[A-Z]{2,3}\.php$')
+
+# WordPress 6.5+ 官方 PHP 翻译文件:*.l10n.php(languages 根目录及 plugins/themes 子目录,
+# 如 zh_CN.l10n.php、admin-zh_CN.l10n.php、plugins/akismet-zh_CN.l10n.php)
+RE_L10N_PHP = re.compile(r'\.l10n\.php$', re.I)
+
+# ---------------------------------------------------------------------------
+# WP 官方已知文件白名单(2026-08-04 真实站误报清单,见 cases/03;"宁可漏,不可滥")
+# 只豁免特定规则,不整文件放行:内容级规则(eval 外部输入等)对白名单文件依然生效
+# ---------------------------------------------------------------------------
+
+# goto 规则豁免:现代 WP 核心自己合法使用 goto
+GOTO_WHITELIST_PATHS = frozenset([
+    'wp-includes/class-wp-block-processor.php',      # WP 6.7+ 核心,goto ×10
+    'wp-includes/compat-utf8.php',                   # WP 7.0 核心 UTF-8 状态机,goto ×5
+    'wp-includes/html-api/class-wp-html-processor.php',  # WP 6.2+ HTML API,goto ×19
+])
+# goto 规则豁免的文件名(任意路径):插件会内嵌 WP DataLiberation php-toolkit 的同名副本
+# (如 hester-core 插件的 Encoding/compat-utf8.php),路径不固定只能按文件名豁免
+GOTO_WHITELIST_BASENAMES = frozenset([
+    'compat-utf8.php',
+])
+
+# base64_decode+eval 共现规则豁免:SimplePie 合法用途(data URI 解码等)
+B64_EVAL_WHITELIST_PATHS = frozenset([
+    'wp-includes/SimplePie/src/Sanitize.php',
+])
+
+# 随机文件名规则豁免的路径前缀:WP 核心库目录(php72compat/php84compat 等兼容层文件)
+RANDOM_NAME_WHITELIST_PREFIXES = ('wp-includes/sodium_compat/',)
+
+# 常见英文词根/词缀(长度 >= 3):合法 PHP 文件命名高频出现,命中即不判随机。
+# 只用于抑制误报,不影响检出——恶意文件通常同时被内容级规则命中
+COMMON_NAME_CHUNKS = frozenset([
+    'copy', 'right', 'type', 'graph', 'plat', 'form', 'full', 'width',
+    'short', 'code', 'plug', 'block', 'theme', 'font', 'icon', 'post',
+    'page', 'user', 'admin', 'class', 'widget', 'menu', 'comment', 'media',
+    'image', 'text', 'list', 'table', 'field', 'button', 'color', 'style',
+    'script', 'search', 'custom', 'option', 'setting', 'template', 'header',
+    'footer', 'sidebar', 'content', 'category', 'author', 'date', 'time',
+    'link', 'file', 'upload', 'download', 'cache', 'session', 'cookie',
+    'token', 'auth', 'login', 'register', 'mail', 'message', 'notice',
+    'error', 'debug', 'rest', 'json', 'html', 'compat', 'simple', 'sanitize',
+    'parser', 'render', 'query', 'request', 'response', 'hook', 'filter',
+    'action', 'core', 'load', 'version', 'function', 'util', 'helper',
+    'config', 'data', 'meta', 'term', 'feed', 'embed', 'cron', 'update',
+    'install', 'network', 'site', 'blog', 'module', 'common', 'default',
+    'const', 'string', 'struct', 'count', 'print', 'array', 'object',
+])
 
 # 赌博关键词(cloaking 初检用)
 GAMBLING_KEYWORDS = [u'赌博', u'棋牌', u'博彩', u'威尼斯人', u'百家乐', u'彩票', u'开元']
@@ -134,18 +185,23 @@ def fmt_time(ts):
 
 def looks_random_name(name):
     """判断文件名(不含扩展名)是否像随机字符串。
-    启发式:全小写字母/数字、长度 >= 8,且元音占比 < 25% 或最长连续辅音 >= 6。
+    启发式:全小写字母/数字、长度 >= 8,且(元音占比 < 25% 或最长连续辅音 >= 6),
+    同时不含任何常见英文词根(见 COMMON_NAME_CHUNKS)。
+    元音含 y——y 在英文里常作元音(copyright/typography),v1.0 把它当辅音导致
+    copyright.php、platforms.php、fullwidth.php 这类正常单词被误杀(cases/03)。
     保守取向,宁可漏判不要误伤 functions.php、shortcodes.php 这类正常文件。
     """
     if len(name) < RANDOM_NAME_MIN_LEN or not RE_RANDOM_NAME.match(name):
         return False
-    vowels = sum(1 for c in name if c in 'aeiou')
+    if any(chunk in name for chunk in COMMON_NAME_CHUNKS):
+        return False
+    vowels = sum(1 for c in name if c in 'aeiouy')
     if vowels * 4 < len(name):  # 元音占比 < 25%
         return True
     run = 0
     max_run = 0
     for c in name:
-        if c not in 'aeiou':
+        if c not in 'aeiouy':
             run += 1
             max_run = max(max_run, run)
         else:
@@ -158,7 +214,7 @@ def looks_random_name(name):
 # ---------------------------------------------------------------------------
 
 def scan_php_file(path, rel, report):
-    """对单个 PHP 文件做特征码扫描,命中写入 report.high"""
+    """对单个 PHP 文件做特征码扫描,命中写入 report.high(超长行单独命中记 suspicious)"""
     try:
         content = read_text(path)
     except (IOError, OSError) as e:
@@ -166,6 +222,8 @@ def scan_php_file(path, rel, report):
         return
 
     lines = content.splitlines()
+    # WP 6.5+ 官方 PHP 翻译文件:内容是翻译数据数组,天然含超长行,豁免超长行规则
+    is_l10n = bool(RE_L10N_PHP.search(rel))
 
     # --- 逐行检查:eval/assert 执行外部输入、create_function、preg_replace /e、超长行 ---
     hit_eval = hit_assert = hit_cf = hit_prege = 0
@@ -186,16 +244,23 @@ def scan_php_file(path, rel, report):
         if len(line) > LONG_LINE_THRESHOLD:
             long_lines.append((idx, len(line)))
 
-    if long_lines:
+    if long_lines and not is_l10n:
         first = long_lines[0]
-        report.add_high(
-            rel,
-            u'存在超长单行(第 %d 行 %d 字符,共 %d 行超过 %d 字符),混淆代码典型特征'
-            % (first[0], first[1], len(long_lines), LONG_LINE_THRESHOLD),
-            first[0])
+        detail = (u'存在超长单行(第 %d 行 %d 字符,共 %d 行超过 %d 字符)'
+                  % (first[0], first[1], len(long_lines), LONG_LINE_THRESHOLD))
+        # v1.1:超长行单独命中降级为可疑(字体变体/icons/formatting 等合法数据文件
+        # 也有超长行,见 cases/03);与其他恶意特征共现才报高危。
+        # 共现触发不含 base64_decode/assert——两者在合法文件里太常见
+        # (SimplePie Parser.php 就是 assert+长行,合法)
+        if (RE_EVAL_ONLY.search(content) or RE_CREATE_FUNCTION.search(content)
+                or RE_PREG_E.search(content) or RE_DANGER_FUNC.search(content)):
+            report.add_high(rel, detail + u',且与其他恶意特征共现,混淆代码典型特征', first[0])
+        else:
+            report.add_suspicious(rel, detail + u',未见其他恶意特征,可能是数据文件,请人工确认', first[0])
 
     # --- 整文件共现检查 ---
-    if RE_B64_DECODE.search(content) and RE_EVAL_ANY.search(content):
+    if (RE_B64_DECODE.search(content) and RE_EVAL_ANY.search(content)
+            and rel not in B64_EVAL_WHITELIST_PATHS):
         report.add_high(rel, u'base64_decode 与 eval/assert 同文件共现(base64 藏马典型组合)')
 
     m_danger = RE_DANGER_FUNC.search(content)
@@ -204,7 +269,8 @@ def scan_php_file(path, rel, report):
                         % m_danger.group(0).rstrip('('))
 
     goto_count = len(RE_GOTO.findall(content))
-    if goto_count >= GOTO_THRESHOLD:
+    if (goto_count >= GOTO_THRESHOLD and rel not in GOTO_WHITELIST_PATHS
+            and rel.rsplit('/', 1)[-1] not in GOTO_WHITELIST_BASENAMES):
         report.add_high(rel, u'goto 混淆:文件内 goto 语句 %d 处(>= %d),正常代码几乎不用 goto'
                         % (goto_count, GOTO_THRESHOLD))
 
@@ -253,12 +319,14 @@ def scan_site(root, days, report):
             if rel.startswith('wp-content/uploads/'):
                 has_uploads_php_rule['hit'] = True
                 report.add_high(rel, u'uploads 目录下出现 PHP 文件(uploads 本应只有图片等媒体文件)')
-            elif rel.startswith('wp-content/languages/') and not RE_LOCALE_PHP.match(name):
+            elif (rel.startswith('wp-content/languages/') and not RE_LOCALE_PHP.match(name)
+                    and not RE_L10N_PHP.search(name)):
                 report.add_high(rel, u'languages 目录下出现非翻译类 PHP 文件(该目录正常只有 .po/.mo)')
 
             # --- 随机文件名 ---
             stem = name[:-4]  # 去掉 .php
-            if looks_random_name(stem):
+            if (looks_random_name(stem)
+                    and not rel.startswith(RANDOM_NAME_WHITELIST_PREFIXES)):
                 report.add_high(rel, u'文件名像随机字符串(%s),正常插件/主题不会这样命名' % name)
 
             # --- webshell 特征码 ---
