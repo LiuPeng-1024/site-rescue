@@ -21,7 +21,7 @@ import os
 import re
 import sys
 
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.1.1"
 REPO_URL = "https://github.com/LiuPeng-1024/site-rescue"
 RUNBOOK_URL = REPO_URL + "/tree/main/runbook"
 
@@ -139,11 +139,23 @@ FALLBACK_TEXT = (u'扫描器在这里命中了已知危险特征(具体见下面
 # 缓存编译后的正则
 _COMPILED_RULES = [(re.compile(p, re.I), t, d) for p, t, d in EXPLAIN_RULES]
 
+# 超长单行"可疑级单独命中"的平静版解释(sr-scan v1.1 起单独命中降级为可疑,
+# 字体/图标/翻译类数据文件也有超长行,不能再套上面"混淆木马典型长相"的高危措辞;
+# 与恶意特征共现的高危级命中仍走 EXPLAIN_RULES 里的严厉版)
+LONG_LINE_SUS_TITLE = u'超长数据行'
+LONG_LINE_SUS_TEXT = (u'这个文件里有一行特别长,但没有发现其他可疑特征。'
+                      u'这种多半是字体、图标、翻译类的数据文件,天生就长这样。'
+                      u'确认一下它是不是你装的插件/主题自带的文件即可。')
 
-def explain(reason):
-    """命中原因 → (标题, 人话解释)"""
+
+def explain(reason, level=u''):
+    """命中原因 + 严重度(u'高危'/u'可疑') → (标题, 人话解释)"""
     for pattern, title, detail in _COMPILED_RULES:
         if pattern.search(reason):
+            # 超长单行按严重度+原因文本分级:可疑级且未见共现 → 平静版
+            if (pattern.pattern == r'超长单行' and level == u'可疑'
+                    and u'共现' not in reason):
+                return LONG_LINE_SUS_TITLE, LONG_LINE_SUS_TEXT
             return title, detail
     return FALLBACK_TITLE, FALLBACK_TEXT
 
@@ -168,8 +180,10 @@ def infer_clues(data):
         clues.append(u'uploads 目录被写进了 PHP 文件。常见原因:某个插件/主题有文件上传漏洞,'
                      u'或者后台已经失陷后被手动上传。')
     # 问题文件是否集中在某个插件/主题目录
+    # (只基于高危命中聚类:可疑命中含大量良性数据文件,聚类会误伤合法插件/主题)
     pref = {}
-    for p in paths:
+    high_paths = [e.get('path', '') for e in highs if e.get('path')]
+    for p in high_paths:
         m = re.match(r'(wp-content/(?:plugins|themes)/[^/]+)/', p)
         if m:
             pref[m.group(1)] = pref.get(m.group(1), 0) + 1
@@ -179,7 +193,7 @@ def infer_clues(data):
     if u'cloaking' in all_reasons.lower():
         clues.append(u'赌博 cloaking 是"进来之后"种下的,不是入口本身;常见入口是漏洞插件或弱密码。')
     if not clues:
-        clues.append(u'扫描结果里没有明显的入口线索,需要查服务器和网站访问日志才能定位'
+        clues.append(u'未发现明确的入侵入口线索,需要查服务器和网站访问日志才能定位'
                      u'(见 runbook 第 5 章《找根因》)。')
     return clues
 
@@ -257,14 +271,14 @@ def build_blocks(data):
     if highs:
         B.append(('p', u'以下是基本可以确定的危险痕迹,每条都配了大白话解释:'))
         for i, e in enumerate(highs, 1):
-            title, detail = explain(e.get('reason', ''))
+            title, detail = explain(e.get('reason', ''), level=u'高危')
             B.append(('finding', {
                 'index': i, 'entry': e, 'level': u'高危',
                 'title': title, 'detail': detail}))
     if sus:
         B.append(('p', u'以下是可疑痕迹 —— 不一定是坏事,但需要你确认:'))
         for i, e in enumerate(sus, 1):
-            title, detail = explain(e.get('reason', ''))
+            title, detail = explain(e.get('reason', ''), level=u'可疑')
             B.append(('finding', {
                 'index': i, 'entry': e, 'level': u'可疑',
                 'title': title, 'detail': detail}))
