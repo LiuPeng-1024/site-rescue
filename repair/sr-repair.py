@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sr-repair.py — 宝塔 + WordPress 被黑站修复安全骨架(v0.1,三闸门)
+sr-repair.py — 宝塔 + WordPress 被黑站修复安全骨架(v0.1.1,三闸门)
 
 定位: 这不是全自动修复引擎,而是"安全执行修复动作的地基"。
 现在的半自动帮清、未来的自动修复引擎,都建立在这三道代码级强制的闸门之上
@@ -24,12 +24,14 @@ sr-repair.py — 宝塔 + WordPress 被黑站修复安全骨架(v0.1,三闸门)
   任何修改性命令加 --dry-run: 只打印将做什么,不动手
 
 退出码: 0 成功 / 1 一般错误 / 2 参数或环境错误 / 3 备份门禁拒绝 / 4 健康回归异常(已自动回滚)
+        / 5 执行失败(自动备份失败 / 权限不足,已打印处理建议)
 
 设计原则(与 sr-scan 相同): 只用 Python 标准库,兼容 Python 3.6+,中文输出。
 v0.1 暂不做: 数据库操作、wp-config 修改、密码重置、核心重装(V1 正式版的事)。
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -41,7 +43,7 @@ import time
 import urllib.error
 import urllib.request
 
-TOOL_VERSION = "0.1.0"
+TOOL_VERSION = "0.1.1"
 REPO_URL = "https://github.com/LiuPeng-1024/site-rescue"
 RUNBOOK_URL = REPO_URL + "/tree/main/runbook"
 
@@ -82,6 +84,43 @@ def sha256_file(path):
                 break
             h.update(chunk)
     return h.hexdigest()
+
+
+def is_perm_error(e):
+    """是否权限类错误(EACCES/EPERM)。生产环境常见: /www/backup 是 root 700,
+    或站点文件不属于当前执行用户。"""
+    if isinstance(e, PermissionError):
+        return True
+    return getattr(e, 'errno', None) in (errno.EACCES, errno.EPERM)
+
+
+def print_perm_advice(action, path, detail):
+    """权限不足时的人话指导: 不打 traceback,直接告诉用户怎么解决。"""
+    sys.stderr.write(u'错误: 权限不足,无法%s。\n' % action)
+    sys.stderr.write(u'      路径: %s\n' % path)
+    sys.stderr.write(u'      系统返回: %s\n' % detail)
+    sys.stderr.write(u'      建议: ① 用 sudo 重新运行;② 检查目录/文件属主与权限(chown/chmod);\n')
+    sys.stderr.write(u'            ③ 或用 --backup-dir / --quarantine-dir 指定当前用户可写的目录。\n')
+
+
+def precheck_writable(dirpath, what):
+    """提前预检目录可写: 不存在则尝试创建,已存在则检查写/进入权限。
+    权限不足打印人话指导并返回 False —— 在动手之前发现问题,而不是走到一半才炸。
+    注意: 这只是提前预检,实际写入处仍有 try/except 兜底。"""
+    try:
+        if not os.path.isdir(dirpath):
+            os.makedirs(dirpath)
+    except (IOError, OSError) as e:
+        if is_perm_error(e):
+            print_perm_advice(u'创建%s' % what, dirpath, e)
+        else:
+            sys.stderr.write(u'错误: 无法创建%s: %s(%s)\n' % (what, dirpath, e))
+        return False
+    if not os.access(dirpath, os.W_OK | os.X_OK):
+        print_perm_advice(u'写入%s' % what, dirpath,
+                          u'当前用户对该目录没有写/进入权限')
+        return False
+    return True
 
 
 def resolve_site_file(site_dir, given):
@@ -126,20 +165,31 @@ def find_recent_backup(dirs):
 
 
 def make_backup(site_dir, dest_dir):
-    """--force-backup: 把整站打成 tar.gz 放进备份目录,并验证产物存在且非空"""
+    """--force-backup: 把整站打成 tar.gz 放进备份目录,并验证产物存在且非空。
+    打包中途失败(如站点文件无读权限)时,把半成品截断为 0 字节再抛错:
+    备份门禁只认非空文件,防止下次运行把残缺的 tar 误当有效备份放行。"""
     if not os.path.isdir(dest_dir):
         os.makedirs(dest_dir)
     name = 'sr-backup-%s.tar.gz' % time.strftime('%Y%m%d-%H%M%S')
     path = os.path.join(dest_dir, name)
-    with tarfile.open(path, 'w:gz') as tar:
-        tar.add(site_dir, arcname=os.path.basename(site_dir.rstrip(os.sep)))
+    try:
+        with tarfile.open(path, 'w:gz') as tar:
+            tar.add(site_dir, arcname=os.path.basename(site_dir.rstrip(os.sep)))
+    except Exception:
+        try:
+            with open(path, 'wb'):
+                pass
+        except (IOError, OSError):
+            pass
+        raise
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         raise IOError(u'备份文件生成后校验失败(不存在或为空)')
     return path
 
 
 def gate_backup(args, site_dir):
-    """闸门 1。返回 True 放行,False 拒绝。"""
+    """闸门 1。返回 0 放行;3 门禁拒绝(无 24h 内备份且未 --force-backup);
+    5 自动备份执行失败(打包失败 / 权限不足,已打印建议)。"""
     print(u'===== 闸门 1/3: 备份门禁 =====')
     search_dirs = []
     if args.backup_dir:
@@ -152,7 +202,7 @@ def gate_backup(args, site_dir):
               % (found[0], fmt_time(found[1]),
                  os.path.getsize(found[0]) / 1048576.0))
         print(u'')
-        return True
+        return 0
 
     print(u'  [未通过] 以下位置均未发现 24 小时内的备份:')
     for d in search_dirs:
@@ -166,19 +216,24 @@ def gate_backup(args, site_dir):
         print(u'    1) 宝塔面板 →「网站」备份站点 +「数据库」备份,然后重新运行本命令;')
         print(u'    2) 重新运行时加 --force-backup,本工具会先把整站打包成 tar.gz 再继续。')
         print(u'')
-        return False
+        return 3
 
     dest_dir = os.path.abspath(args.backup_dir) if args.backup_dir else DEFAULT_BACKUP_ROOT
     print(u'  --force-backup 已指定,先自动打包整站到: %s' % dest_dir)
+    if not precheck_writable(dest_dir, u'备份目录'):
+        return 5
     try:
         bpath = make_backup(site_dir, dest_dir)
     except (IOError, OSError, tarfile.TarError) as e:
-        sys.stderr.write(u'错误: 自动备份失败,拒绝继续执行: %s\n' % e)
-        return False
+        if is_perm_error(e):
+            print_perm_advice(u'完成自动备份(写入备份目录)', dest_dir, e)
+        else:
+            sys.stderr.write(u'错误: 自动备份失败,拒绝继续执行: %s\n' % e)
+        return 5
     print(u'  [通过] 自动备份完成: %s(%.1f MB)'
           % (bpath, os.path.getsize(bpath) / 1048576.0))
     print(u'')
-    return True
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +335,13 @@ def compare_health(before, after):
 
 def prepare_quarantine_dir(args, site_dir):
     """创建本次操作的隔离目录 <base>/quarantine-YYYYmmdd-HHMM(-N)/files。
-    安全校验: 隔离区必须位于站点目录之外。"""
+    安全校验: 隔离区必须位于站点目录之外。
+    返回 (隔离目录, 退出码): 成功时退出码为 0;失败时隔离目录为 None。"""
     base = os.path.abspath(args.quarantine_dir) if args.quarantine_dir else DEFAULT_BACKUP_ROOT
     site_prefix = site_dir.rstrip(os.sep) + os.sep
     if base.startswith(site_prefix) or base == site_dir.rstrip(os.sep):
         sys.stderr.write(u'错误: 隔离目录不能放在站点目录里面(那等于没隔离): %s\n' % base)
-        return None
+        return None, 2
     stamp = time.strftime('%Y%m%d-%H%M')
     qdir = os.path.join(base, 'quarantine-' + stamp)
     n = 2
@@ -295,9 +351,12 @@ def prepare_quarantine_dir(args, site_dir):
     try:
         os.makedirs(os.path.join(qdir, 'files'))
     except (IOError, OSError) as e:
-        sys.stderr.write(u'错误: 隔离目录创建失败: %s(%s)\n' % (qdir, e))
-        return None
-    return qdir
+        if is_perm_error(e):
+            print_perm_advice(u'创建隔离目录', qdir, e)
+        else:
+            sys.stderr.write(u'错误: 隔离目录创建失败: %s(%s)\n' % (qdir, e))
+        return None, 5
+    return qdir, 0
 
 
 def save_manifest(mpath, m):
@@ -306,17 +365,27 @@ def save_manifest(mpath, m):
 
 
 def quarantine_files(site_dir, qdir, resolved):
-    """逐个把文件移入隔离区(保留相对路径结构),返回 manifest entries。
-    全程只有 shutil.move,没有任何直接删除站点文件的调用。"""
+    """逐个把文件移入隔离区(保留相对路径结构)。
+    全程只有 shutil.move,没有任何直接删除站点文件的调用。
+    返回 (entries, 错误描述): 错误描述为 None 表示全部成功;中途失败(如权限不足)
+    时已成功移动的文件保留在 entries 里 —— 调用方先写 manifest 留证再退出,
+    保证已移动的文件随时可用 --rollback 还原。"""
     entries = []
     for ap, rel, reasons in resolved:
         dst = os.path.join(qdir, 'files', rel)
-        parent = os.path.dirname(dst)
-        if not os.path.isdir(parent):
-            os.makedirs(parent)
-        digest = sha256_file(ap)
-        st = os.stat(ap)
-        shutil.move(ap, dst)
+        try:
+            parent = os.path.dirname(dst)
+            if not os.path.isdir(parent):
+                os.makedirs(parent)
+            digest = sha256_file(ap)
+            st = os.stat(ap)
+            shutil.move(ap, dst)
+        except (IOError, OSError, shutil.Error) as e:
+            if is_perm_error(e):
+                print_perm_advice(u'移动文件到隔离区', ap, e)
+            else:
+                sys.stderr.write(u'错误: 隔离文件失败 %s: %s\n' % (rel, e))
+            return entries, u'隔离 %s 失败: %s' % (rel, e)
         entries.append({
             'relative_path': rel,
             'original_path': ap,
@@ -329,7 +398,7 @@ def quarantine_files(site_dir, qdir, resolved):
             'status': 'quarantined',
         })
         print(u'  [已隔离] %s' % rel)
-    return entries
+    return entries, None
 
 
 def rollback_manifest(mpath, dry_run=False):
@@ -506,8 +575,18 @@ def cmd_repair(args, site_dir):
     print(u'')
 
     # ---- 闸门 1: 备份门禁 ----
-    if not gate_backup(args, site_dir):
-        return 3
+    gate_rc = gate_backup(args, site_dir)
+    if gate_rc:
+        return gate_rc
+
+    # ---- 预检: 隔离区根目录可写(提前发现"在站点内/没权限写",而不是移到一半才炸) ----
+    qbase = os.path.abspath(args.quarantine_dir) if args.quarantine_dir else DEFAULT_BACKUP_ROOT
+    site_prefix = site_dir.rstrip(os.sep) + os.sep
+    if qbase.startswith(site_prefix) or qbase == site_dir.rstrip(os.sep):
+        sys.stderr.write(u'错误: 隔离目录不能放在站点目录里面(那等于没隔离): %s\n' % qbase)
+        return 2
+    if not precheck_writable(qbase, u'隔离区根目录'):
+        return 5
 
     # ---- 闸门 3 前置: 操作前快照 ----
     before = None
@@ -529,10 +608,10 @@ def cmd_repair(args, site_dir):
 
     # ---- 闸门 2: 隔离不删 ----
     print(u'===== 闸门 2/3: 隔离(只移不删,全程留证) =====')
-    qdir = prepare_quarantine_dir(args, site_dir)
+    qdir, qrc = prepare_quarantine_dir(args, site_dir)
     if qdir is None:
-        return 2
-    entries = quarantine_files(site_dir, qdir, resolved)
+        return qrc
+    entries, qerr = quarantine_files(site_dir, qdir, resolved)
     print(u'隔离目录: %s' % qdir)
 
     manifest = {
@@ -544,12 +623,18 @@ def cmd_repair(args, site_dir):
         'quarantine_dir': qdir,
         'health_before': public_snapshot(before),
         'entries': entries,
-        'status': 'quarantined',
+        'status': 'partial_failure' if qerr else 'quarantined',
     }
     mpath = os.path.join(qdir, 'manifest.json')
     save_manifest(mpath, manifest)
     print(u'manifest 已写入: %s' % mpath)
     print(u'')
+
+    if qerr is not None:
+        print(u'★ 隔离中途失败: %s' % qerr)
+        print(u'  已成功隔离的 %d 个文件已写入 manifest 留证,可随时回滚:' % len(entries))
+        print(u'  python3 sr-repair.py --rollback %s' % mpath)
+        return 5
 
     # ---- 闸门 3: 健康回归 ----
     if before is not None:
